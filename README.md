@@ -1,20 +1,10 @@
-# kvraft — a distributed key-value store with Raft consensus
+# kvraft: a distributed key-value store with Raft consensus
 
-A replicated, fault-tolerant key-value store written from scratch in Go. The
-replication layer is a complete Raft implementation: leader election, log
-replication, durable persistence, log compaction via snapshots, and the
-`InstallSnapshot` path for catching up far-behind followers. On top of Raft sits
-a linearizable key-value state machine with exactly-once client semantics, a CLI
-client, and a fault-injection test suite that kills and partitions nodes.
+A replicated, fault-tolerant key-value store I wrote from scratch in Go. The replication layer is a full Raft implementation: leader election, log replication, durable persistence, log compaction via snapshots, and the `InstallSnapshot` path for catching up followers that have fallen way behind. On top of Raft there's a linearizable key-value state machine with exactly-once client semantics, a CLI client, and a test suite that kills and partitions nodes to make sure none of it breaks.
 
-The whole thing has no third-party dependencies — only the Go standard library.
+No third-party dependencies, just the Go standard library.
 
-> **Transport note.** The wire layer uses Go's `net/rpc`. The original brief
-> asked for gRPC; this was built in a sandbox where the gRPC module host
-> (`google.golang.org`) is firewalled, so gRPC stubs can't be fetched or
-> compiled there. The Raft and KV layers are transport-agnostic — `proto/kvstore.proto`
-> defines the equivalent gRPC service, and swapping it in is a thin-adapter
-> change (see [Swapping in gRPC](#swapping-in-grpc)).
+> **Transport note.** The wire layer uses Go's `net/rpc`. The original brief asked for gRPC, but I built this in a sandbox where the gRPC module host (`google.golang.org`) is firewalled, so the gRPC stubs can't be fetched or compiled there. The Raft and KV layers don't care what the transport is. `proto/kvstore.proto` defines the equivalent gRPC service, and swapping it in is a thin adapter change (see [Swapping in gRPC](#swapping-in-grpc)).
 
 ---
 
@@ -49,7 +39,7 @@ The whole thing has no third-party dependencies — only the Go standard library
    +-------------+          +-------------+          +-------------+
 ```
 
-**Request lifecycle (a write):**
+**What happens on a write:**
 
 ```
 client --Put(k,v)--> leader.KV.PutAppend
@@ -62,103 +52,64 @@ client --Put(k,v)--> leader.KV.PutAppend
    leader's waiting RPC handler is signalled -> returns OK to client
 ```
 
-Reads (`Get`) go through the log too, so they observe a linearizable point in
-the committed history rather than possibly-stale local state.
+Reads (`Get`) go through the log too, so they see a linearizable point in the committed history instead of possibly-stale local state.
 
 ### Layers
 
-| Layer | Package | Responsibility |
+| Layer | Package | What it does |
 |-------|---------|----------------|
-| Consensus | `raft/` | Election, replication, commit, persistence, snapshots. Transport-agnostic. |
-| State machine | `kv/` | Applies committed ops; dedup via `(clientID, seq)`; snapshot encode/restore. |
-| Transport | `raft/network.go` | `Transport` interface. `MemNetwork` (tests) + `NetTransport` (TCP/`net/rpc`). |
-| Persistence | `raft/persister.go` | `FilePersister` (atomic disk writes) + `MemPersister` (tests). |
-| Server | `cmd/kvnode` | Wires it together; serves Raft + KV RPCs on one port. |
-| Client | `cmd/kvctl`, `kv/client.go` | Leader discovery + automatic retry. |
+| Consensus | `raft/` | Election, replication, commit, persistence, snapshots. Doesn't know or care about the transport. |
+| State machine | `kv/` | Applies committed ops, dedups via `(clientID, seq)`, snapshot encode/restore. |
+| Transport | `raft/network.go` | A `Transport` interface. `MemNetwork` for tests, `NetTransport` (TCP/`net/rpc`) for real runs. |
+| Persistence | `raft/persister.go` | `FilePersister` (atomic disk writes) and `MemPersister` (tests). |
+| Server | `cmd/kvnode` | Wires it all together and serves Raft + KV RPCs on one port. |
+| Client | `cmd/kvctl`, `kv/client.go` | Finds the leader, retries automatically. |
 
 ---
 
-## The consensus protocol
+## How the consensus actually works
 
-Raft keeps a replicated, append-only **log** identical across servers; applying
-that log in order makes every state machine converge. A single elected **leader**
-owns all writes at any moment, which makes the protocol far easier to reason
-about than leaderless schemes.
+Raft keeps an append-only **log** that's identical across servers, and applying that log in order makes every state machine end up in the same place. One elected **leader** owns all writes at any given moment, which makes the whole thing much easier to reason about than leaderless designs.
 
 ### 1. Terms and roles
 
-Time is divided into **terms**, each starting with an election. Every server is a
-**Follower**, **Candidate**, or **Leader**. Every RPC carries the sender's term;
-seeing a higher term immediately forces a server back to Follower and updates its
-term. This single rule is what guarantees stale leaders step down.
+Time is split into **terms**, each kicked off by an election. Every server is a **Follower**, **Candidate**, or **Leader**. Every RPC carries the sender's term, and seeing a higher term immediately knocks a server back to Follower and bumps its term. That one rule is what makes stale leaders step down.
 
 ### 2. Leader election
 
-A follower that hears nothing from a leader within a randomized timeout
-(300–600 ms here) becomes a candidate: it increments its term, votes for itself,
-and sends `RequestVote` to everyone. A server grants its vote only if it hasn't
-already voted this term **and** the candidate's log is at least as up-to-date as
-its own (compared by last-entry term, then index — Raft §5.4.1). Winning a
-**majority** makes the candidate leader; randomized timeouts make split votes
-rare and self-correcting. *(`raft.go`: `startElection`, `RequestVote`, `becomeLeader`.)*
+A follower that hasn't heard from a leader within a randomized timeout (300 to 600 ms here) becomes a candidate: it bumps its term, votes for itself, and sends `RequestVote` to everyone. A server grants its vote only if it hasn't already voted this term and the candidate's log is at least as up to date as its own (compared by last-entry term, then index, per Raft section 5.4.1). Win a **majority** and you're the leader. Randomized timeouts keep split votes rare and self-correcting. (`raft.go`: `startElection`, `RequestVote`, `becomeLeader`.)
 
 ### 3. Log replication
 
-Clients send commands to the leader, which appends them and sends `AppendEntries`
-to each follower. Each entry includes the `prevLogIndex/prevLogTerm` of the entry
-before it; a follower rejects the RPC unless that previous entry matches. This
-**log-matching property** means a successful append proves the follower's log is
-identical to the leader's up to that point. On rejection, the follower returns a
-conflict hint so the leader can back up by a whole term in one round instead of
-one entry at a time (§5.3 optimization). *(`replicateTo`, `AppendEntries`.)*
+Clients send commands to the leader, which appends them and sends `AppendEntries` to each follower. Each entry includes the `prevLogIndex/prevLogTerm` of the entry before it, and a follower rejects the RPC unless that previous entry matches. This is the **log-matching property**: a successful append proves the follower's log is identical to the leader's up to that point. On a rejection the follower returns a conflict hint, so the leader can back up a whole term in one round instead of crawling back one entry at a time (the section 5.3 optimization). (`replicateTo`, `AppendEntries`.)
 
 ### 4. Commitment
 
-An entry is **committed** once it lives on a majority of servers. The leader
-tracks `matchIndex[]` per follower and advances `commitIndex` to the highest
-index replicated on a majority — but, crucially, only for entries from its
-**own current term** (§5.4.2). Committing an older-term entry only indirectly,
-by committing a current-term entry above it, is what prevents a subtle
-already-committed-then-overwritten bug. Committed entries flow to the state
-machine over `applyCh`, in order, by a single applier goroutine. *(`advanceCommit`, `applier`.)*
+An entry is **committed** once it lives on a majority of servers. The leader tracks `matchIndex[]` per follower and advances `commitIndex` to the highest index replicated on a majority, but only for entries from its **own current term** (section 5.4.2). Committing an older-term entry only indirectly, by committing a current-term entry above it, is what avoids a nasty already-committed-then-overwritten bug. Committed entries flow to the state machine over `applyCh`, in order, from a single applier goroutine. (`advanceCommit`, `applier`.)
 
 ### 5. Persistence
 
-Before responding to any RPC that changes them, a server flushes `currentTerm`,
-`votedFor`, and its `log` to disk (atomic temp-file + rename). After a crash it
-reloads these and rejoins seamlessly — the property the `TestPersistence` and
-`TestKVRestart` tests exercise by power-cycling every node. *(`persist`, `readPersist`, `FilePersister`.)*
+Before responding to any RPC that changes them, a server flushes `currentTerm`, `votedFor`, and its `log` to disk (atomic temp file plus rename). After a crash it reloads these and rejoins like nothing happened. That's the property `TestPersistence` and `TestKVRestart` hammer on by power-cycling every node. (`persist`, `readPersist`, `FilePersister`.)
 
-### 6. Snapshots / log compaction
+### 6. Snapshots and log compaction
 
-An unbounded log would grow forever. When the state machine's persisted size
-crosses a threshold, it serializes its state and calls `Raft.Snapshot(index)`,
-which discards all log entries at or below `index`, keeping a sentinel that
-records the snapshot's last-included index and term. All log access goes through
-offset helpers (`snapIndex`, `entry`, `termAt`) so compaction is invisible to the
-rest of the code. A follower so far behind that the needed entries are already
-compacted is caught up with `InstallSnapshot` instead of log replay; it installs
-the snapshot wholesale and resumes. *(`Snapshot`, `InstallSnapshot`, index helpers.)*
+An unbounded log grows forever, which isn't great. When the state machine's persisted size crosses a threshold, it serializes its state and calls `Raft.Snapshot(index)`, which throws away all log entries at or below `index` and keeps a sentinel recording the snapshot's last-included index and term. All log access goes through offset helpers (`snapIndex`, `entry`, `termAt`), so compaction is invisible to the rest of the code. A follower so far behind that the entries it needs are already gone gets caught up with `InstallSnapshot` instead of log replay: it installs the snapshot wholesale and carries on. (`Snapshot`, `InstallSnapshot`, the index helpers.)
 
 ### Exactly-once client semantics
 
-Because clients retry on leader changes, the same write could reach the log
-twice. Each request carries `(clientID, seq)`; the state machine remembers the
-highest `seq` applied per client and ignores anything not strictly newer, so an
-`Append` retried after a failover is never applied twice. The dedup table is
-included in snapshots so it survives compaction and restarts. *(`kv/server.go`: `applier`.)*
+Since clients retry on leader changes, the same write can reach the log twice. Each request carries `(clientID, seq)`, the state machine remembers the highest `seq` it has applied per client, and it ignores anything that isn't strictly newer. So an `Append` retried after a failover never gets applied twice. The dedup table rides along in snapshots, so it survives compaction and restarts. (`kv/server.go`: `applier`.)
 
 ---
 
 ## Build and run
 
-Requires Go 1.21+ (uses the `min` builtin). No external modules.
+Needs Go 1.21+ (it uses the `min` builtin). No external modules.
 
 ```bash
 make build          # -> bin/kvnode, bin/kvctl
 ```
 
-Start a 3-node cluster (each node in its own terminal, or use `make cluster`):
+Start a 3-node cluster (each node in its own terminal, or just `make cluster`):
 
 ```bash
 ./bin/kvnode --id 0 --peers 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 --data ./data0
@@ -177,30 +128,26 @@ P=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
 ./bin/kvctl --peers $P delete name
 ```
 
-Now kill whichever node `status` shows as `leader: YES`. Within a second a new
-leader is elected, your data is intact, and writes resume — the exact scenario
-verified end-to-end in testing.
+Now kill whichever node `status` shows as `leader: YES`. Within a second a new leader is elected, your data is still there, and writes keep working. That's the exact scenario the tests check end to end.
 
-`kvnode` flags: `--id`, `--peers`, `--listen` (defaults to this node's peers
-entry), `--data` (state/snapshot dir), `--maxstate` (snapshot threshold in bytes,
-`-1` disables snapshotting).
+`kvnode` flags: `--id`, `--peers`, `--listen` (defaults to this node's peers entry), `--data` (state/snapshot dir), `--maxstate` (snapshot threshold in bytes, `-1` turns snapshotting off).
 
 ## Tests
 
 ```bash
 make test        # full suite
-make test-race   # same, under the race detector (clean)
+make test-race   # same thing under the race detector (clean)
 ```
 
 | Test | What it simulates |
 |------|-------------------|
-| `raft/TestElection` | Leader elected; re-elected after the leader is disconnected. |
+| `raft/TestElection` | Leader elected, then re-elected after the leader is disconnected. |
 | `raft/TestReplication` | Commands replicate to every follower at the right index. |
-| `raft/TestLeaderFailure` | Cluster keeps committing through a leader crash; old leader catches up. |
-| `raft/TestPartition` | Minority partition can't commit; majority does; logs converge on heal. |
-| `raft/TestPersistence` | State survives crash-restart of every node. |
-| `raft/TestSnapshot` | Far-behind follower caught up via `InstallSnapshot`. |
-| `kv/TestKVConcurrentAppends` | 5 clients × 20 appends land exactly once (linearizable, deduped). |
+| `raft/TestLeaderFailure` | Cluster keeps committing through a leader crash, old leader catches up. |
+| `raft/TestPartition` | Minority partition can't commit, majority does, logs converge once it heals. |
+| `raft/TestPersistence` | State survives a crash-restart of every node. |
+| `raft/TestSnapshot` | A far-behind follower gets caught up via `InstallSnapshot`. |
+| `kv/TestKVConcurrentAppends` | 5 clients times 20 appends each land exactly once (linearizable, deduped). |
 | `kv/TestKVFailover` / `TestKVRestart` / `TestKVSnapshot` | End-to-end correctness under the same failures. |
 
 ## Project layout
@@ -223,16 +170,8 @@ go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 protoc --go_out=. --go-grpc_out=. proto/kvstore.proto
 ```
 
-Then implement the generated `KVServer`/`RaftServer` interfaces as adapters that
-call the existing `kv.KVServer` and `raft.RPCEndpoint` methods, and point
-`NetTransport`/`Clerk` at gRPC clients. Nothing in `raft/` or the KV state
-machine changes — that separation is the whole point of the `Transport`
-interface.
+Then implement the generated `KVServer`/`RaftServer` interfaces as adapters that call the existing `kv.KVServer` and `raft.RPCEndpoint` methods, and point `NetTransport`/`Clerk` at gRPC clients. Nothing in `raft/` or the KV state machine has to change, which is the whole reason the `Transport` interface exists.
 
-## Known simplifications
+## Things I deliberately left out
 
-Cluster membership is static (no dynamic add/remove), and there's no read-lease
-optimization (reads go through the log for linearizability rather than being
-served from a leader lease). Both are deliberate scope cuts, not correctness
-gaps — the safety-critical parts (election restriction, current-term commit rule,
-snapshot index handling) are implemented in full.
+Cluster membership is static (no dynamic add/remove), and there's no read-lease optimization (reads go through the log for linearizability instead of being served from a leader lease). Both are scope cuts, not correctness gaps. The safety-critical parts (election restriction, current-term commit rule, snapshot index handling) are all implemented in full.
