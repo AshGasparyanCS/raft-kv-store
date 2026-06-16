@@ -1,5 +1,7 @@
 # kvraft: a distributed key-value store with Raft consensus
 
+![tests](https://github.com/AshGasparyanCS/raft-kv-store/actions/workflows/tests.yml/badge.svg)
+
 A replicated, fault-tolerant key-value store I wrote from scratch in Go. The replication layer is a full Raft implementation: leader election, log replication, durable persistence, log compaction via snapshots, and the `InstallSnapshot` path for catching up followers that have fallen way behind. On top of Raft there's a linearizable key-value state machine with exactly-once client semantics, a CLI client, and a test suite that kills and partitions nodes to make sure none of it breaks.
 
 No third-party dependencies, just the Go standard library.
